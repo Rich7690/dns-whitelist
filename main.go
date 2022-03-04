@@ -11,7 +11,14 @@ import (
 	"github.com/oracle/oci-go-sdk/v50/core"
 )
 
+var (
+	version string
+	commit  string
+)
+
 func main() {
+	log.Println("Version: " + version)
+	log.Println("Commit: " + commit)
 	ctx, cancel := context.WithCancel(context.Background())
 	addrs, err := net.LookupHost(os.Getenv("DNS_RECORD"))
 	if err != nil {
