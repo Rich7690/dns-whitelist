@@ -13,12 +13,16 @@ import (
 )
 
 var (
-	version       string
-	commit        string
-	DisableUpdate bool = os.Getenv("DISABLE_UPDATE") == "true"
+	version         string
+	commit          string
+	DisableUpdate   bool = os.Getenv("DISABLE_UPDATE") == "true"
+	DisableChecking bool = os.Getenv("DISABLE_CHECKS") == "true"
 )
 
 func doSelfUpdate() {
+	if DisableChecking {
+		return
+	}
 	selfupdate.SetLogger(log.Default()) // enable when debug logging is needed
 	updater, err := selfupdate.NewUpdater(selfupdate.Config{Validator: &selfupdate.ChecksumValidator{UniqueFilename: "checksums.txt"}})
 	if err != nil {
