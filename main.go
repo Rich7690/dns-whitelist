@@ -3,10 +3,15 @@ package main
 import (
 	"context"
 	"errors"
+	"io/ioutil"
 	"log"
 	"net"
+	"net/http"
 	"os"
+	"os/signal"
+	"path"
 	"strings"
+	"syscall"
 
 	"github.com/cloudflare/cloudflare-go"
 	"github.com/creativeprojects/go-selfupdate"
@@ -24,6 +29,8 @@ var (
 	dnsRecord       string = os.Getenv("DNS_RECORD")
 	listID          string = os.Getenv("LIST_ID")
 	accountID       string = os.Getenv("ACCOUNT_ID")
+	serverMode      bool   = os.Getenv("SERVER_MODE") == "true"
+	bindAddr        string = os.Getenv("BIND_ADDR")
 )
 
 func doSelfUpdate() {
@@ -38,7 +45,7 @@ func doSelfUpdate() {
 	}
 
 	if DisableUpdate {
-		latest, found, lerr := updater.DetectLatest("rtdev7690/dns-whitelist")
+		latest, found, lerr := updater.DetectLatest("rich7690/dns-whitelist")
 		if lerr != nil {
 			log.Printf("Error finding latest version: %v\n", lerr)
 			return
@@ -52,7 +59,7 @@ func doSelfUpdate() {
 		return
 	}
 
-	latest, err := updater.UpdateSelf(version, "rtdev7690/dns-whitelist")
+	latest, err := updater.UpdateSelf(version, "rich7690/dns-whitelist")
 	if err != nil {
 		log.Println("Binary update failed:", err)
 		return
@@ -151,10 +158,16 @@ func whitelistCloudflare(ctx context.Context) error {
 	return nil
 }
 
-func whitelistOCI(ctx context.Context) error {
-	addrs, err := net.LookupHost(dnsRecord)
-	if err != nil {
-		return err
+func whitelistOCI(ctx context.Context, ips []string) error {
+	var addrs []string
+	if len(ips) > 0 {
+		addrs = ips
+	} else {
+		var err error
+		addrs, err = net.LookupHost(dnsRecord)
+		if err != nil {
+			return err
+		}
 	}
 
 	if len(addrs) == 0 {
@@ -163,9 +176,14 @@ func whitelistOCI(ctx context.Context) error {
 
 	log.Printf("%v", addrs)
 
+	if os.Getenv("LOCAL") != "" {
+		return nil
+	}
+
 	provider := common.DefaultConfigProvider()
 
 	if os.Getenv("LOCAL") == "" {
+		var err error
 		provider, err = auth.InstancePrincipalConfigurationProvider()
 		if err != nil {
 			return err
@@ -225,20 +243,72 @@ func main() {
 	log.Println("Commit: " + commit)
 	ctx, cancel := context.WithCancel(context.Background())
 	doSelfUpdate()
+	exitChan := make(chan os.Signal, 1)
+	signal.Notify(exitChan, syscall.SIGINT, os.Interrupt)
 
-	var err error
-	switch provider {
-	case "OCI":
-		err = whitelistOCI(ctx)
-	case "Cloudflare":
-		err = whitelistCloudflare(ctx)
-	default:
-		err = errors.New("unsupported provider: " + provider)
+	if serverMode {
+		tmp := os.TempDir()
+		cache := path.Join(tmp, "/ip_cache")
+		bits, err := ioutil.ReadFile(cache)
+		if err != nil {
+			log.Println("err reading cached ip: ", err)
+		}
+		cachedIP := strings.TrimSpace(string(bits))
+		log.Println("Cached ip: ", cachedIP)
+
+		http.DefaultServeMux.HandleFunc("/ip", func(w http.ResponseWriter, r *http.Request) {
+			val := r.URL.Query().Get("ip")
+			log.Println("ip: ", val)
+			parsed := net.ParseIP(val)
+			if parsed == nil {
+				http.Error(w, "Invalid ip: "+val, http.StatusBadRequest)
+				return
+			}
+			if parsed.String() != cachedIP {
+				err := whitelistOCI(ctx, []string{parsed.String()})
+				if err != nil {
+					log.Println("err: ", err.Error())
+					http.Error(w, err.Error(), http.StatusInternalServerError)
+					return
+				}
+				cachedIP = parsed.String()
+				err = os.WriteFile(cache, []byte(cachedIP), 0644)
+				if err != nil {
+					log.Println("err caching ip: ", err.Error())
+				}
+			} else {
+				//log.Println("Cached ip is the same. NOOP")
+			}
+			w.WriteHeader(http.StatusOK)
+		})
+
+		go func() {
+			err := http.ListenAndServe(bindAddr, http.DefaultServeMux)
+
+			if err != nil && err != http.ErrServerClosed {
+				log.Fatalln("Error: ", err)
+			}
+		}()
+		log.Println("Listing on:, ", bindAddr)
+
+		<-exitChan
+
+	} else {
+		var err error
+		switch provider {
+		case "OCI":
+			err = whitelistOCI(ctx, nil)
+		case "Cloudflare":
+			err = whitelistCloudflare(ctx)
+		default:
+			err = errors.New("unsupported provider: " + provider)
+		}
+
+		if err != nil {
+			log.Fatal(err)
+		}
+		log.Println("Updated rules")
 	}
 
-	if err != nil {
-		log.Fatal(err)
-	}
-	log.Println("Updated rules")
 	cancel()
 }
